@@ -28,6 +28,37 @@ Every buy requires your explicit approval. The sub-agent never places a market o
 
 See [`SPEC.md`](./SPEC.md) for the full specification — hard rules, sizing, pipeline details, state files, failure modes.
 
+## Setup
+
+Requires Python 3.11+ and [`uv`](https://github.com/astral-sh/uv) (already installed on this box at `/usr/local/bin/uv`).
+
+```bash
+make install    # creates .venv and installs requirements.txt
+```
+
+Then any of:
+
+```bash
+make demo       # render a demo PNG+HTML chart pair (default INFY)
+make demo SYM=RELIANCE
+make status     # show both portfolios
+make digest     # run daily digest in dry-run mode
+make earnings   # print the 5-day earnings blackout set
+make test       # import + smoke check all modules
+```
+
+Or run directly without make:
+
+```bash
+.venv/bin/python chart_render.py --demo INFY
+```
+
+## Dependencies
+
+`matplotlib` is heavy (~30MB with all font backends) but only required for the PNG renderer. The lightweight HTML chart uses `lightweight-charts` from a CDN — no Python dep.
+
+The system Python on this box is the Hermes Agent venv. **Always use the MiniTrader venv** (`make install` creates it). Never `pip install --user` into the Hermes venv.
+
 ## Status
 
 Under active development. See the GitHub issues for current work.
