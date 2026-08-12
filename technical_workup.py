@@ -20,19 +20,37 @@ SPEC.md names the three outcomes but doesn't enumerate every failure path):
 `should_attach_gtt()` encodes the §4 GTT-attachment rule: attach (-7% stop,
 +20% target) when RSI(14) > 65 or price is within 3% of its recent
 (60-trading-day) swing high; otherwise let a clean uptrend run with no GTT.
+
+`fetch_ohlc()`'s primary path is real Kite Connect historical data via
+`kite_session.historical_data()` (batch 2). It keeps a deterministic
+synthetic-random-walk fallback (`_synthetic_ohlc`, seeded on `symbol` — NOT
+real market data) for when the Kite session is unavailable, logged loudly at
+WARNING when it's used. This is a deliberate compromise: `daily_digest.py`
+(out of batch-2 scope) calls `fetch_ohlc` directly as its offline/dry-run
+data source whenever no MCP dispatcher is wired — which is always true for a
+bare subprocess, since nothing in this codebase calls `set_mcp_dispatcher()`
+yet. Dropping the fallback entirely would make `make digest` (and the Phase
+6 cron job that runs it) raise on every invocation. Callers that must know
+whether they're looking at real data (e.g. `--demo` below) check
+`kite_session.get_session_status()` explicitly instead of relying on
+`fetch_ohlc`'s silent fallback.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+import time
 import zlib
-from datetime import date
-from typing import Any
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
 import earnings_calendar
+import kite_session
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +72,16 @@ VERDICT_BUY_READY = "BUY-READY"
 VERDICT_BUY_SKIP = "BUY-SKIP"
 VERDICT_WAIT = "WAIT"
 
+OHLC_CACHE_DIR = Path(__file__).resolve().parent / ".venv" / "var" / "ohlc_cache"
+OHLC_CACHE_TTL_SECONDS = 6 * 60 * 60
 
-def fetch_ohlc(symbol: str, days: int = 365) -> pd.DataFrame:
-    """Return daily OHLCV data for `symbol` over the trailing `days` days.
 
-    TODO(kite): this is a stub. Replace the body with a real call to
-    `kite.historical_data()` (Kite Connect) once a live/authenticated Kite
-    session is wired up — that session check belongs in subagent.py, not
-    here. This function must stay import-safe and callable with zero live
-    dependencies (constraint 2 of the build brief), so `chart_render.py` and
-    this module's own indicator/verdict logic can be smoke-tested without a
-    Kite session. The data below is a deterministic (seeded on `symbol`),
-    realistic-looking synthetic random walk — it is NOT real market data.
+def _synthetic_ohlc(symbol: str, days: int = 365) -> pd.DataFrame:
+    """Deterministic (seeded on `symbol`) synthetic random-walk OHLCV — NOT real data.
+
+    Fallback used by `fetch_ohlc()` only when a live Kite session is
+    unavailable, so offline/dry-run callers (see module docstring) keep
+    working. Never call this directly expecting real market data.
 
     Args:
         symbol: NSE trading symbol, e.g. ``"INFY"``.
@@ -94,6 +110,102 @@ def fetch_ohlc(symbol: str, days: int = 365) -> pd.DataFrame:
         {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
         index=pd.Index(dates, name="date"),
     )
+
+
+def fetch_ohlc(symbol: str, days: int = 365) -> pd.DataFrame:
+    """Return daily OHLCV data for `symbol` over the trailing `days` days.
+
+    Primary path: `kite_session.historical_data()` (real Kite Connect data).
+    Falls back to `_synthetic_ohlc()` — logged at WARNING — if the Kite
+    session is unavailable. See module docstring for why the fallback
+    exists.
+
+    Args:
+        symbol: NSE trading symbol, e.g. ``"INFY"``.
+        days: Number of trailing calendar days to span.
+
+    Returns:
+        A DataFrame indexed by date with columns
+        ``open, high, low, close, volume``, oldest row first.
+    """
+    end = date.today()
+    start = end - timedelta(days=days)
+    try:
+        return kite_session.historical_data(symbol, start, end)
+    except kite_session.KiteSessionExpired:
+        logger.warning(
+            "fetch_ohlc(%s): Kite session unavailable — falling back to synthetic OHLC (NOT real market data)", symbol
+        )
+    except RuntimeError as exc:
+        logger.warning(
+            "fetch_ohlc(%s): live historical_data fetch failed (%s) — falling back to synthetic OHLC (NOT real market data)",
+            symbol,
+            exc,
+        )
+    return _synthetic_ohlc(symbol, days=days)
+
+
+def _load_ohlc_cache(cache_base: Path) -> Optional[pd.DataFrame]:
+    """Read a fresh (<=TTL) OHLC cache file, trying parquet then pickle.
+
+    Args:
+        cache_base: Cache path without extension (e.g. ``INFY_20260812``).
+
+    Returns:
+        The cached DataFrame, or ``None`` if no fresh cache file exists.
+    """
+    for path in (cache_base.with_suffix(".parquet"), cache_base.with_suffix(".pkl")):
+        if not path.exists():
+            continue
+        age = time.time() - path.stat().st_mtime
+        if age > OHLC_CACHE_TTL_SECONDS:
+            continue
+        try:
+            df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+            logger.info("fetch_ohlc_cached: using cache %s (age=%.0fs)", path, age)
+            return df
+        except Exception as exc:
+            logger.warning("fetch_ohlc_cached: failed reading cache %s (%s)", path, exc)
+    return None
+
+
+def _save_ohlc_cache(cache_base: Path, df: pd.DataFrame) -> None:
+    """Write `df` to `cache_base` as parquet, falling back to pickle if pyarrow is unavailable.
+
+    Args:
+        cache_base: Cache path without extension.
+        df: OHLCV DataFrame to persist.
+    """
+    cache_base.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(cache_base.with_suffix(".parquet"))
+    except Exception as exc:
+        logger.warning("fetch_ohlc_cached: parquet write failed (%s), falling back to pickle", exc)
+        df.to_pickle(cache_base.with_suffix(".pkl"))
+
+
+def fetch_ohlc_cached(symbol: str, days: int = 365) -> pd.DataFrame:
+    """`fetch_ohlc()` wrapped with a 6-hour on-disk cache.
+
+    Cache file: ``.venv/var/ohlc_cache/<symbol>_<YYYYMMDD>.parquet`` (or
+    ``.pkl`` if pyarrow isn't installed). On stale or missing cache, fetches
+    fresh via `fetch_ohlc()`.
+
+    Args:
+        symbol: NSE trading symbol.
+        days: Number of trailing calendar days to span.
+
+    Returns:
+        The (possibly cached) OHLCV DataFrame.
+    """
+    cache_base = OHLC_CACHE_DIR / f"{symbol.upper()}_{date.today():%Y%m%d}"
+    cached = _load_ohlc_cache(cache_base)
+    if cached is not None:
+        return cached
+
+    df = fetch_ohlc(symbol, days=days)
+    _save_ohlc_cache(cache_base, df)
+    return df
 
 
 def _rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
