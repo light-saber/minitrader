@@ -13,6 +13,7 @@ charts/html/*.html
 
 # Logs
 logs/*.log
+logs/approval_log.csv
 
 # Python
 __pycache__/

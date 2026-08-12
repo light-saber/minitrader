@@ -199,6 +199,83 @@ def dispatch(portfolio_name: str, signal: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"unknown portfolio_name {portfolio_name!r}, expected 'live' or 'paper'")
 
 
+def _validate_proposal(portfolio_name: str, quantity: int, price: float) -> Optional[str]:
+    """Validate sizing inputs against the local portfolio mandate.
+
+    This is a deterministic first line of defence; live execution retains its
+    full Kite-backed pre-trade guard in ``kite_exec``.
+    """
+    if portfolio_name not in {"live", "paper"}:
+        return "portfolio_name must be 'live' or 'paper'"
+    if quantity <= 0 or price <= 0:
+        return "quantity and price must be positive"
+    rules = LIVE_RULES if portfolio_name == "live" else PAPER_RULES
+    value = quantity * price
+    if value < rules["min_order_value"]:
+        return f"order value ₹{value:.2f} is below the ₹{rules['min_order_value']:.2f} minimum"
+    max_value = rules["total_capital"] * rules["max_position_pct"]
+    if value > max_value:
+        return f"order value ₹{value:.2f} exceeds the ₹{max_value:.2f} position limit"
+    return None
+
+
+def propose_buy(
+    portfolio_name: str, symbol: str, quantity: int, ltp: float, verdict: str,
+    indicators: dict[str, Any], chart_png_path: str | None, chart_html_path: str | None,
+) -> dict[str, Any]:
+    """Run the Discord human-in-the-loop buy flow.
+
+    A timeout, skip, invalid customize request, or any execution error returns
+    without retrying. Only an exact Discord ``go`` may reach an executor.
+    """
+    import approval_gate
+
+    if portfolio_name not in {"live", "paper"}:
+        return {"status": "error", "order_id": None, "error": "unknown portfolio"}
+    message_id = approval_gate.post_buy_prompt(
+        portfolio_name, symbol, quantity, ltp, verdict, indicators, chart_png_path, chart_html_path,
+    )
+    decision_result = approval_gate.await_decision(message_id, timeout_minutes=30)
+    customize_args: dict[str, float | int] = {}
+    if isinstance(decision_result, tuple):
+        decision, customize_args = decision_result
+    else:
+        decision = decision_result
+    approval_gate.record_decision(message_id, decision, symbol, portfolio_name)
+    if decision == "timeout":
+        logger.warning("approval timed out for %s; no order will be placed", symbol)
+        return {"status": "timeout", "order_id": None, "error": "approval timed out; no order placed"}
+    if decision == "skip":
+        logger.info("approval skipped for %s", symbol)
+        return {"status": "skipped", "order_id": None, "error": None}
+    if decision == "customize":
+        quantity = int(customize_args.get("qty", quantity))
+        ltp = float(customize_args.get("price", ltp))
+    if decision not in {"go", "customize"}:
+        return {"status": "skipped", "order_id": None, "error": "unrecognized approval decision"}
+    validation_error = _validate_proposal(portfolio_name, quantity, ltp)
+    if validation_error:
+        logger.warning("approval proposal refused for %s: %s", symbol, validation_error)
+        return {"status": "refused", "order_id": None, "error": validation_error}
+    try:
+        if portfolio_name == "live":
+            import os
+            import kite_exec
+
+            if os.environ.get("MINITRADER_ENABLE_LIVE_ORDERS") != "1":
+                return {"status": "refused", "order_id": None, "error": "live orders are disabled"}
+            result = kite_exec.place_live_buy_dry_run(symbol, quantity)
+        else:
+            import paper_exec
+
+            result = paper_exec.place_paper_buy_at_ltp(symbol, quantity)
+            paper_exec.record_paper_fill(result["order_id"], float(result["average_price"]), quantity, symbol)
+    except Exception as exc:
+        logger.error("approved buy failed for %s; refusing to retry: %s", symbol, exc)
+        return {"status": "error", "order_id": None, "error": str(exc)}
+    return {"status": result.get("status", "complete").lower(), "order_id": result.get("order_id"), "error": None}
+
+
 def _format_status(portfolio: Portfolio) -> str:
     """Build a human-readable status summary line for one portfolio.
 
@@ -240,12 +317,29 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     parser = argparse.ArgumentParser(prog="subagent.py", description="MiniTrader dual-portfolio sub-agent")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
     subparsers.add_parser("status", help="Print live + paper portfolio status")
+    parser.add_argument("--propose", nargs=3, metavar=("SYM", "QTY", "PRICE"), help="Post an offline-safe buy proposal")
     args = parser.parse_args()
 
+    if args.propose:
+        symbol, quantity, price = args.propose[0], int(args.propose[1]), float(args.propose[2])
+        import approval_gate
+        body = approval_gate.build_buy_prompt("paper", symbol, quantity, price, "BUY-READY", {
+            "sector": "Unknown", "rsi14": 45.0, "above_50dma": True, "above_200dma": True,
+            "volume_ratio": 1.0, "earnings_clear": True,
+        }, None, None)
+        print(body)
+        print("awaiting decision... (synthetic timeout in offline mode)")
+        print(propose_buy("paper", symbol, quantity, price, "BUY-READY", {
+            "sector": "Unknown", "rsi14": 45.0, "above_50dma": True, "above_200dma": True,
+            "volume_ratio": 1.0, "earnings_clear": True,
+        }, None, None))
+        return
     if args.command == "status":
         print_status()
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

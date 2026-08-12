@@ -243,6 +243,16 @@ def place_live_buy(
     )
 
 
+def place_live_buy_dry_run(symbol: str, quantity: int) -> dict[str, Any]:
+    """Record a live-buy dry run without ever submitting a Kite order.
+
+    This is the execution seam used by the approval flow in this non-live
+    build. The production runtime may replace this seam only after all live
+    guards and explicit approval are present.
+    """
+    return place_live_buy(symbol, quantity, enable_live_orders=False)
+
+
 def attach_gtt(symbol: str, trigger_values: dict[str, float], qty: int, last_price: float) -> dict[str, Any]:
     """Attach a two-leg GTT (stop-loss + target) via `mcp__kite__place_gtt_order`.
 

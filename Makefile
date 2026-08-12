@@ -6,7 +6,7 @@ VENV := .venv
 PY   := $(VENV)/bin/python
 PIP  := uv pip install --python $(PY)
 
-.PHONY: help install demo status digest earnings smoke preflight paper-buy status-kite test clean
+.PHONY: help install demo status digest earnings smoke preflight paper-buy status-kite propose test clean
 
 SYM ?= INFY
 QTY ?= 5
@@ -39,6 +39,9 @@ preflight:  ## Run pre-trade guards without placing an order
 
 paper-buy:  ## Place a paper buy at live LTP (records only)
 	$(PY) paper_exec.py --smoke $(SYM) $(QTY)
+
+propose:  ## Post a buy prompt to Discord and wait for go/skip
+	$(PY) subagent.py --propose $(SYM) $(QTY) $(PRICE)
 
 status-kite:  ## One-glance Kite + dry-run status
 	$(PY) kite_exec.py --status
