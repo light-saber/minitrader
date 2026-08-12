@@ -15,8 +15,8 @@ SPEC.md §5 as a caveat.
 
 from __future__ import annotations
 
+import argparse
 import csv
-import inspect
 import logging
 import uuid
 from datetime import date, timedelta
@@ -24,11 +24,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import subagent
+import kite_session
 from kite_exec import TRADE_CSV_COLUMNS, pretrade_guard  # shared guard interface, SPEC.md §9
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["pretrade_guard", "place_paper_buy", "record_paper_fill"]
+__all__ = ["pretrade_guard", "place_paper_buy", "place_paper_buy_at_ltp", "place_paper_gtt", "record_paper_fill"]
 
 
 def _new_paper_state() -> dict[str, Any]:
@@ -87,6 +88,59 @@ def place_paper_buy(symbol: str, qty: int, ltp: float, product: str = "CNC") -> 
     return result
 
 
+def place_paper_buy_at_ltp(symbol: str, quantity: int) -> dict[str, Any]:
+    """Place a paper buy using live LTP from `kite_session`.
+
+    Args:
+        symbol: NSE trading symbol.
+        quantity: Quantity to buy in the paper portfolio.
+
+    Returns:
+        The virtual fill result returned by `place_paper_buy`.
+
+    Raises:
+        kite_session.KiteSessionExpired: If no current quote is available,
+            including when the Kite session has expired.
+    """
+    result = kite_session.get_ltp([symbol])
+    if not result:
+        raise kite_session.KiteSessionExpired(
+            "Kite session expired or no live LTP available — re-authenticate before placing a paper fill."
+        )
+    ltp = float(result[symbol.upper()])
+    return place_paper_buy(symbol, quantity, ltp)
+
+
+def place_paper_gtt(symbol: str, qty: int, trigger_price: float) -> dict[str, Any]:
+    """Track a paper GTT trigger without submitting or auto-resolving an order.
+
+    Args:
+        symbol: NSE trading symbol covered by the trigger.
+        qty: Quantity covered by the paper GTT.
+        trigger_price: Price that a future daily paper-GTT check should watch.
+
+    Returns:
+        A tracked paper-GTT record with a synthetic identifier.
+    """
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+    if trigger_price <= 0:
+        raise ValueError("trigger_price must be positive")
+    gtt = {
+        "gtt_id": f"PAPER_GTT_{uuid.uuid4().hex}",
+        "symbol": symbol.upper(),
+        "quantity": qty,
+        "trigger_price": float(trigger_price),
+        "status": "TRACKED",
+        "created_at": date.today().isoformat(),
+    }
+    state = subagent.load_state(subagent.PAPER_STATE_PATH) or _new_paper_state()
+    state.setdefault("paper_gtts", []).append(gtt)
+    subagent.save_state(subagent.PAPER_STATE_PATH, state)
+    logger.info("tracked paper GTT (no automatic resolution): %s", gtt)
+    return gtt
+
+
 def _append_trade_row(path: Path, row: dict[str, Any]) -> None:
     """Append one row to a trade journal CSV, writing the header if new.
 
@@ -127,6 +181,7 @@ def record_paper_fill(order_id: str, fill_price: float, qty: int, symbol: str, g
             "order_id": order_id,
             "gtt_id": ";".join(gtt_ids) if gtt_ids else "",
             "realised_pnl_delta": 0.0,
+            "status": "COMPLETE",
         },
     )
 
@@ -144,12 +199,18 @@ def record_paper_fill(order_id: str, fill_price: float, qty: int, symbol: str, g
 
 
 def main() -> None:
-    """CLI entry point — describes the module without executing any trading logic."""
+    """Run the safe live-LTP paper-buy smoke command from the CLI."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    print("paper_exec.py — Phase 5 paper execution module (imports only; no MCP calls, ever).")
-    for name in ("pretrade_guard", "place_paper_buy", "record_paper_fill"):
-        fn = globals()[name]
-        print(f"  {name}{inspect.signature(fn)}")
+    parser = argparse.ArgumentParser(description="MiniTrader paper execution")
+    parser.add_argument("--smoke", nargs=2, metavar=("SYM", "QTY"), help="Record a paper fill at live LTP")
+    args = parser.parse_args()
+    if not args.smoke:
+        parser.print_help()
+        return
+    symbol, quantity = args.smoke[0], int(args.smoke[1])
+    fill = place_paper_buy_at_ltp(symbol, quantity)
+    record_paper_fill(fill["order_id"], float(fill["average_price"]), quantity, symbol)
+    print(fill)
 
 
 if __name__ == "__main__":
