@@ -38,6 +38,7 @@ ALLOWED_ORDER_TYPES = ("MARKET", "LIMIT")
 
 # Live portfolio sizing rules (SPEC.md §3, "Live portfolio (₹5K window)").
 LIVE_RULES: dict[str, Any] = {
+    "portfolio_name": "live",
     "total_capital": 5000,
     "max_positions": 1,
     "max_position_pct": 1.0,
@@ -50,6 +51,7 @@ LIVE_RULES: dict[str, Any] = {
 
 # Paper portfolio sizing rules (SPEC.md §3, "Paper portfolio (configurable, default ₹50,000)").
 PAPER_RULES: dict[str, Any] = {
+    "portfolio_name": "paper",
     "total_capital": 50000,
     "max_positions": 8,
     "max_position_pct": 0.20,
