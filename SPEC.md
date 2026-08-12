@@ -24,11 +24,26 @@ Both portfolios run the **same Phase 1–4 pipeline** (screener → mandate filt
 - **Live Phase 5:** `mcp__kite__place_order` with real CNC buy.
 - **Paper Phase 5:** writes a virtual fill to `/root/.hermes/cases/vibetrading/paper_state.json` and `paper_trades.csv`, using the live LTP at the moment of "execution" as the fill price (no slippage assumption — flag this as a caveat).
 
-You (Sachin) approve both. Same gate, same chart, same prompt — just one extra line that says **"This is paper."** when applicable.
-
 **Phase 6 (daily digest)** reports both portfolios side-by-side, with Nifty50 as the benchmark for both.
 
 This is **not** an autonomous trading system. Every buy (live or paper) requires an explicit human go-ahead. The sub-agent's job is to do the screening, sizing, charting, and bookkeeping — *you* make the entry decision in both cases.
+
+### 1.2 — Trade lifecycle (8-step human-in-the-loop flow)
+
+Confirmed by Sachin on 12 Aug 2026 as the canonical operating procedure for both portfolios:
+
+1. **MiniTrader runs the screener** and picks stocks based on the mandate (Phase 2).
+2. **MiniTrader recommends a single best pick** for the current capital, sized per §3, with the technical verdict + chart attached.
+3. **Sachin approves** by replying `go` / `skip` / `customize <qty|price>` to the Discord buy prompt.
+4. **MiniTrader executes the trade** (live or paper), attaches the GTT if warranted, and starts monitoring.
+5. **MiniTrader decides if the stock should be sold.** A sell is proposed when ANY of: (a) the +20% target hits, (b) the -7% stop hits, (c) the trailing-stop logic fires, (d) holding-period and target-progress math says exit is optimal for hitting the 30-day alpha target.
+6. **MiniTrader tells Sachin** with a Discord sell prompt that includes the same indicators + chart + reason.
+7. **Sachin approves** by replying `go` / `skip` / `hold <N more days>`.
+8. **Both monitor the outcome daily** via the 09:00 IST digest and any triggered GTT notifications.
+
+**Sells always require explicit approval** — same gate as buys. The sub-agent never fires a sell order on its own, even when a GTT trigger condition is met. (Pre-attached GTTs that *fire automatically* on Kite's side are different — those are exits you already approved at entry time.)
+
+**The 3-day minimum holding period** (Sachin, 12 Aug 2026) is enforced before any sell proposal. If a stock is held <3 days, the sub-agent will refuse to propose a sell no matter what the indicators say.
 
 ---
 
