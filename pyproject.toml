@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minitrader"
+version = "0.1.0"
+description = "Dual-portfolio Kite trading sub-agent for the Hermes Agent platform."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Sachin Acharya" }]
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "mplfinance>=0.12",
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
+
+[tool.setuptools]
+py-modules = [
+    "subagent",
+    "earnings_calendar",
+    "technical_workup",
+    "chart_render",
+    "screener_filter",
+    "kite_exec",
+    "paper_exec",
+    "daily_digest",
+]
