@@ -6,7 +6,10 @@ VENV := .venv
 PY   := $(VENV)/bin/python
 PIP  := uv pip install --python $(PY)
 
-.PHONY: help install demo status digest test clean
+.PHONY: help install demo status digest earnings smoke preflight paper-buy status-kite test clean
+
+SYM ?= INFY
+QTY ?= 5
 
 help:  ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -28,10 +31,23 @@ digest:  ## Run the daily digest in dry-run mode (prints, no Discord post)
 earnings:  ## Print the 5-day earnings blackout set
 	$(PY) earnings_calendar.py --dry-run
 
+smoke:  ## Run end-to-end smoke test
+	$(PY) scripts/smoke.py
+
+preflight:  ## Run pre-trade guards without placing an order
+	$(PY) kite_exec.py --preflight $(SYM) $(QTY)
+
+paper-buy:  ## Place a paper buy at live LTP (records only)
+	$(PY) paper_exec.py --smoke $(SYM) $(QTY)
+
+status-kite:  ## One-glance Kite + dry-run status
+	$(PY) kite_exec.py --status
+
 test:  ## Run import + smoke checks on all modules
 	@for f in *.py; do $(PY) -m py_compile $$f && echo "  ✓ $$f"; done
 	@echo "✓ all modules compile"
 	@$(PY) subagent.py status
+	@$(PY) scripts/smoke.py
 
 clean:  ## Remove venv + generated charts + pycache (keeps state.json + trades.csv)
 	rm -rf $(VENV) __pycache__ charts/png/*.png charts/html/*.html logs/*.log
