@@ -1,0 +1,12 @@
+Run the MiniTrader daily digest.
+
+Steps:
+1. cd /root/.hermes/cases/vibetrading/
+2. Run `.venv/bin/python daily_digest.py --dry-run` and capture stdout.
+3. If exit code 0: post the captured stdout to Discord channel id `1517387649520762960` using the discord MCP tool (look for create_message or similar — check tool list).
+4. If exit code non-zero: post a short error message to the same channel — "⚠️ MiniTrader digest failed: <error>" — do NOT silently fail.
+5. Do not post more than once per scheduled run.
+
+If the Kite session is expired and the digest reports it, include that in the message — don't try to fix it. The user logs in manually.
+
+If make digest writes "DRY_RUN" / synthetic data fallbacks, still post — the user should see the pipeline is alive even when offline.
