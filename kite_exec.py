@@ -24,19 +24,33 @@ needs.
 
 from __future__ import annotations
 
+import argparse
 import csv
-import inspect
 import logging
+import os
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+import kite_session
 import subagent
 
 logger = logging.getLogger(__name__)
 
-TRADE_CSV_COLUMNS = ["date", "symbol", "side", "qty", "price", "order_id", "gtt_id", "realised_pnl_delta"]
+TRADE_CSV_COLUMNS = [
+    "date",
+    "symbol",
+    "side",
+    "qty",
+    "price",
+    "order_id",
+    "gtt_id",
+    "realised_pnl_delta",
+    "status",
+]
 NSE_BSE_SUFFIXES = (".NS", ".BO")
+LIVE_ORDERS_ENABLED = os.environ.get("MINITRADER_ENABLE_LIVE_ORDERS", "0") == "1"
 
 _mcp_dispatcher: Optional[Callable[..., dict[str, Any]]] = None
 
@@ -132,6 +146,8 @@ def pretrade_guard(
         ``(True, "")`` if every check passes, else ``(False, reason)`` for
         the first failing check.
     """
+    kite_session.ensure_session()
+
     if not kite_session_active:
         return False, "Kite session not active — re-authenticate via mcp_kite_login before retrying"
 
@@ -155,12 +171,12 @@ def pretrade_guard(
 
 def place_live_buy(
     symbol: str,
-    qty: int,
+    quantity: int,
     product: str = "CNC",
     order_type: str = "MARKET",
-    price: Optional[float] = None,
+    enable_live_orders: bool = False,
 ) -> dict[str, Any]:
-    """Place a real live CNC buy order via `mcp__kite__place_order`.
+    """Safely stage a CNC buy, with real order placement permanently gated.
 
     Performs NO guard checks itself — callers must run `pretrade_guard()`
     and get an explicit human `go` first (SPEC.md §4, Phase 4/5). On any
@@ -169,46 +185,62 @@ def place_live_buy(
 
     Args:
         symbol: NSE trading symbol to buy.
-        qty: Quantity to buy.
+        quantity: Quantity to buy.
         product: Must be ``"CNC"`` — MiniTrader never places FnO/MIS/BO/CO orders.
         order_type: ``"MARKET"`` or ``"LIMIT"``.
-        price: Required when `order_type` is ``"LIMIT"``.
+        enable_live_orders: Explicit caller opt-in for live orders. This alone
+            is insufficient; the import-time environment gate is also required.
 
     Returns:
-        The order result dict from Kite (at least an `order_id`).
+        A synthetic dry-run result.
 
     Raises:
-        ValueError: If `product` isn't CNC, `order_type` is unsupported, or
-            a LIMIT order is missing `price`.
-        RuntimeError: If order placement fails for any reason.
+        ValueError: If `product` isn't CNC or `order_type` is unsupported.
+        LiveOrdersNotEnabled: Always for explicit live-order calls in this
+            non-interactive build unless the module was imported with the
+            environment gate enabled (and then still refuses pending an
+            interactive approval flow).
     """
     if product != "CNC":
         raise ValueError(f"product must be CNC, got {product!r} — MiniTrader never places FnO/MIS/BO/CO orders")
     if order_type not in ("MARKET", "LIMIT"):
         raise ValueError(f"unsupported order_type {order_type!r}")
 
-    payload: dict[str, Any] = {
-        "exchange": "NSE",
-        "tradingsymbol": symbol,
-        "transaction_type": "BUY",
-        "quantity": qty,
-        "product": product,
-        "order_type": order_type,
-    }
-    if order_type == "LIMIT":
-        if price is None:
-            raise ValueError("price is required for LIMIT orders")
-        payload["price"] = price
+    if not enable_live_orders:
+        order_id = f"DRY_RUN_{uuid.uuid4().hex}"
+        result = {
+            "order_id": order_id,
+            "status": "DRY_RUN",
+            "symbol": symbol.upper(),
+            "quantity": quantity,
+            "product": product,
+            "order_type": order_type,
+        }
+        logger.warning("live buy suppressed (dry run): %s", result)
+        _append_trade_row(
+            subagent.TRADES_CSV_PATH,
+            {
+                "date": date.today().isoformat(),
+                "symbol": symbol.upper(),
+                "side": "BUY",
+                "qty": quantity,
+                "price": "",
+                "order_id": order_id,
+                "gtt_id": "",
+                "realised_pnl_delta": 0.0,
+                "status": "DRY_RUN",
+            },
+        )
+        return result
 
-    logger.info("placing live CNC buy: %s", payload)
-    try:
-        result = _call_mcp_tool("mcp__kite__place_order", **payload)
-    except Exception as exc:
-        logger.error("live order placement failed for %s: %s", symbol, exc)
-        raise RuntimeError(f"live order placement failed for {symbol}: {exc}") from exc
-
-    logger.info("live order placed: %s", result)
-    return result
+    if not LIVE_ORDERS_ENABLED:
+        raise LiveOrdersNotEnabled(
+            "live orders are disabled; set MINITRADER_ENABLE_LIVE_ORDERS=1 before importing kite_exec "
+            "to enable the interactive approval path"
+        )
+    raise LiveOrdersNotEnabled(
+        "live order placement remains non-interactive; obtain explicit Discord `go` approval before wiring it"
+    )
 
 
 def attach_gtt(symbol: str, trigger_values: dict[str, float], qty: int, last_price: float) -> dict[str, Any]:
@@ -277,6 +309,20 @@ def _append_trade_row(path: Path, row: dict[str, Any]) -> None:
         path: Destination CSV path (`trades.csv` or `paper_trades.csv`).
         row: Must contain exactly the keys in `TRADE_CSV_COLUMNS`.
     """
+    if path.exists():
+        with path.open("r", newline="", encoding="utf-8") as f:
+            existing_rows = list(csv.DictReader(f))
+        with path.open("r", newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), [])
+        if header != TRADE_CSV_COLUMNS:
+            logger.info("migrating trade CSV schema at %s to include status", path)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS)
+                writer.writeheader()
+                for existing_row in existing_rows:
+                    existing_row.setdefault("status", "COMPLETE")
+                    writer.writerow({column: existing_row.get(column, "") for column in TRADE_CSV_COLUMNS})
+
     is_new = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", newline="", encoding="utf-8") as f:
@@ -327,6 +373,7 @@ def record_fill(order_id: str, fill_price: float, qty: int, symbol: str, gtt_ids
             "order_id": order_id,
             "gtt_id": ";".join(gtt_ids) if gtt_ids else "",
             "realised_pnl_delta": 0.0,
+            "status": "COMPLETE",
         },
     )
 
@@ -343,13 +390,76 @@ def record_fill(order_id: str, fill_price: float, qty: int, symbol: str, gtt_ids
     logger.info("recorded live fill: %s qty=%d price=%.2f order_id=%s", symbol, qty, fill_price, order_id)
 
 
+class LiveOrdersNotEnabled(RuntimeError):
+    """Raised when a caller attempts a real order in the dry-run-only build."""
+
+
+def _run_preflight(symbol: str, quantity: int) -> int:
+    """Run the fail-closed pre-trade guard and print a concise result.
+
+    Args:
+        symbol: NSE trading symbol to check.
+        quantity: Proposed quantity.
+
+    Returns:
+        Zero when all guards pass, otherwise one.
+    """
+    try:
+        ltp = kite_session.get_ltp([symbol]).get(symbol.upper())
+        if ltp is None:
+            ltp = 0.0
+        ok, reason = pretrade_guard(
+            symbol=symbol,
+            qty=quantity,
+            price=ltp,
+            shortlist=[symbol],
+            existing_positions=[],
+            available_margin=subagent.LIVE_RULES["total_capital"],
+            kite_session_active=True,
+            max_order_value=subagent.LIVE_RULES["total_capital"],
+        )
+    except kite_session.KiteSessionExpired as exc:
+        print(f"session: FAIL — {exc}")
+        print("remaining guards: SKIPPED (session guard fails closed)")
+        return 1
+    print(f"session: PASS")
+    print(f"pre-trade checks: {'PASS' if ok else 'FAIL'}{f' — {reason}' if reason else ''}")
+    return 0 if ok else 1
+
+
+def _print_status() -> None:
+    """Print live-order gate, Kite session, and recent dry-run journal rows."""
+    print(f"LIVE_ORDERS_ENABLED: {LIVE_ORDERS_ENABLED}")
+    print(f"Kite session: {kite_session.get_session_status()}")
+    print("Last 3 dry-run rows:")
+    if not subagent.TRADES_CSV_PATH.exists():
+        print("  none")
+        return
+    with subagent.TRADES_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        rows = [row for row in csv.DictReader(f) if row.get("status") == "DRY_RUN"]
+    for row in rows[-3:][::-1]:
+        print(f"  {row}")
+    if not rows:
+        print("  none")
+
+
 def main() -> None:
-    """CLI entry point — describes the module without executing any trading logic."""
+    """Run safe Kite execution diagnostics and dry-run commands from the CLI."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    print("kite_exec.py — Phase 5 live execution module (imports only; places no orders when run directly).")
-    for name in ("pretrade_guard", "place_live_buy", "attach_gtt", "record_fill"):
-        fn = globals()[name]
-        print(f"  {name}{inspect.signature(fn)}")
+    parser = argparse.ArgumentParser(description="MiniTrader safe live-execution controls")
+    parser.add_argument("--preflight", nargs=2, metavar=("SYM", "QTY"))
+    parser.add_argument("--dry-buy", nargs=2, metavar=("SYM", "QTY"))
+    parser.add_argument("--status", action="store_true")
+    args = parser.parse_args()
+    if args.preflight:
+        raise SystemExit(_run_preflight(args.preflight[0], int(args.preflight[1])))
+    if args.dry_buy:
+        print(place_live_buy(args.dry_buy[0], int(args.dry_buy[1])))
+        return
+    if args.status:
+        _print_status()
+        return
+    parser.print_help()
 
 
 if __name__ == "__main__":
