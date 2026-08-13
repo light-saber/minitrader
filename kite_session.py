@@ -64,6 +64,15 @@ class KiteSessionExpired(RuntimeError):
     """Raised when the Kite session is not active (or the MCP gateway is unreachable)."""
 
 
+class LTPPriceOutOfBandError(RuntimeError):
+    """Raised when a returned LTP is implausibly far from the recent market range.
+
+    Used by `paper_exec.place_paper_buy_at_ltp()` to refuse to record a fill at
+    a price that looks like bad dispatcher/test data rather than real market
+    data. See paper_exec.LTP_SANITY_TOLERANCE for the band definition.
+    """
+
+
 def set_mcp_dispatcher(dispatcher: Callable[..., Any]) -> None:
     """Inject the Hermes runtime's MCP tool-calling function.
 

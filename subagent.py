@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import kite_session  # used for KiteSessionExpired / LTPPriceOutOfBandError in propose_buy except clause
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -270,6 +272,15 @@ def propose_buy(
 
             result = paper_exec.place_paper_buy_at_ltp(symbol, quantity)
             paper_exec.record_paper_fill(result["order_id"], float(result["average_price"]), quantity, symbol)
+    except (kite_session.KiteSessionExpired, kite_session.LTPPriceOutOfBandError) as exc:
+        # Surface the guard failure distinctly so the caller (approval_gate /
+        # Discord) can prompt Sachin to re-authenticate or override, rather
+        # than treating the error string as a generic "approved buy failed"
+        # and silently abandoning the position. (fix/paper-infy-entry-price —
+        # 2026-08-12 fill was recorded at ₹1,500.25 because upstream caught
+        # and stringified the original exception into a non-actionable status.)
+        logger.error("paper buy refused for %s; surface to user for explicit action: %s", symbol, exc)
+        return {"status": "refused", "order_id": None, "error": f"{type(exc).__name__}: {exc}"}
     except Exception as exc:
         logger.error("approved buy failed for %s; refusing to retry: %s", symbol, exc)
         return {"status": "error", "order_id": None, "error": str(exc)}

@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["pretrade_guard", "place_paper_buy", "place_paper_buy_at_ltp", "place_paper_gtt", "record_paper_fill"]
 
+# Sanity band for an incoming LTP before we record a paper fill. A returned
+# price that differs from the 5-day median close by more than this fraction
+# is treated as bad dispatcher/test data rather than real market data and
+# triggers `LTPPriceOutOfBandError` (see fix/paper-infy-entry-price — 2026-08-12
+# entry was recorded at ₹1,500.25 vs actual ₹1,176.10 close, ~+27.5% drift).
+LTP_SANITY_TOLERANCE = 0.15
+LTP_SANITY_LOOKBACK_DAYS = 5
+
 
 def _new_paper_state() -> dict[str, Any]:
     """Build a fresh paper `paper_state.json` payload for a new run.
@@ -88,8 +96,60 @@ def place_paper_buy(symbol: str, qty: int, ltp: float, product: str = "CNC") -> 
     return result
 
 
+def _validate_ltp_against_history(symbol: str, ltp: float) -> None:
+    """Cross-check a returned LTP against the recent real-market close range.
+
+    Pulls the trailing `LTP_SANITY_LOOKBACK_DAYS` daily closes via
+    `kite_session.historical_data()` and refuses the fill if `ltp` is more than
+    `LTP_SANITY_TOLERANCE` away from the median of those closes.
+
+    Args:
+        symbol: NSE trading symbol.
+        ltp: Candidate LTP to validate (typically from `kite_session.get_ltp`).
+
+    Raises:
+        kite_session.KiteSessionExpired: If the historical-data fetch is not
+            available — propagated so the caller can surface a re-auth prompt
+            rather than silently substituting.
+        kite_session.LTPPriceOutOfBandError: If `ltp` is more than
+            `LTP_SANITY_TOLERANCE` from the 5-day median close. This is the
+            guard that catches dispatcher/test data leaking into the paper book.
+    """
+    end = date.today()
+    start = end - timedelta(days=LTP_SANITY_LOOKBACK_DAYS)
+    try:
+        df = kite_session.historical_data(symbol, start, end)
+    except kite_session.KiteSessionExpired:
+        # No live reference data — refuse the fill rather than guess.
+        raise
+    closes = df["close"].astype(float).tolist()
+    if not closes:
+        raise kite_session.LTPPriceOutOfBandError(
+            f"no recent closes available for {symbol} — cannot validate LTP ₹{ltp:.2f}"
+        )
+    sorted_closes = sorted(closes)
+    median = sorted_closes[len(sorted_closes) // 2]
+    if median <= 0:
+        raise kite_session.LTPPriceOutOfBandError(
+            f"5-day median close for {symbol} is non-positive ({median}); refusing to validate LTP ₹{ltp:.2f}"
+        )
+    drift = abs(ltp - median) / median
+    if drift > LTP_SANITY_TOLERANCE:
+        raise kite_session.LTPPriceOutOfBandError(
+            f"LTP ₹{ltp:.2f} for {symbol} drifts {drift:.1%} from 5-day median close "
+            f"₹{median:.2f} (band ±{LTP_SANITY_TOLERANCE:.0%}) — refusing to record fill. "
+            f"Re-confirm after the next live quote; do not override without explicit Sachin approval."
+        )
+
+
 def place_paper_buy_at_ltp(symbol: str, quantity: int) -> dict[str, Any]:
     """Place a paper buy using live LTP from `kite_session`.
+
+    Pulls live LTP via `kite_session.get_ltp`, then cross-checks it against
+    the 5-day median close (`_validate_ltp_against_history`) to refuse any
+    dispatcher/test data that drifts more than `LTP_SANITY_TOLERANCE` from
+    the real-market band. Empty LTP responses or prices outside the band
+    propagate as exceptions — never silently substituted.
 
     Args:
         symbol: NSE trading symbol.
@@ -99,8 +159,11 @@ def place_paper_buy_at_ltp(symbol: str, quantity: int) -> dict[str, Any]:
         The virtual fill result returned by `place_paper_buy`.
 
     Raises:
-        kite_session.KiteSessionExpired: If no current quote is available,
-            including when the Kite session has expired.
+        kite_session.KiteSessionExpired: If no current LTP is available,
+            including when the Kite session has expired, OR if the
+            historical-data cross-check cannot reach the live session.
+        kite_session.LTPPriceOutOfBandError: If the returned LTP is more than
+            `LTP_SANITY_TOLERANCE` away from the 5-day median close.
     """
     result = kite_session.get_ltp([symbol])
     if not result:
@@ -108,6 +171,7 @@ def place_paper_buy_at_ltp(symbol: str, quantity: int) -> dict[str, Any]:
             "Kite session expired or no live LTP available — re-authenticate before placing a paper fill."
         )
     ltp = float(result[symbol.upper()])
+    _validate_ltp_against_history(symbol, ltp)
     return place_paper_buy(symbol, quantity, ltp)
 
 
@@ -199,11 +263,24 @@ def record_paper_fill(order_id: str, fill_price: float, qty: int, symbol: str, g
 
 
 def main() -> None:
-    """Run the safe live-LTP paper-buy smoke command from the CLI."""
+    """Run the safe live-LTP paper-buy smoke command from the CLI.
+
+    Also exercises the LTP sanity guard via a self-test when `--self-test`
+    is passed: a stubbed `kite_session.get_ltp` returning ``{}`` must
+    propagate as `KiteSessionExpired` and never reach `record_paper_fill`.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="MiniTrader paper execution")
     parser.add_argument("--smoke", nargs=2, metavar=("SYM", "QTY"), help="Record a paper fill at live LTP")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run guard self-tests (no live Kite call) and exit",
+    )
     args = parser.parse_args()
+    if args.self_test:
+        _run_self_tests()
+        return
     if not args.smoke:
         parser.print_help()
         return
@@ -211,6 +288,46 @@ def main() -> None:
     fill = place_paper_buy_at_ltp(symbol, quantity)
     record_paper_fill(fill["order_id"], float(fill["average_price"]), quantity, symbol)
     print(fill)
+
+
+def _run_self_tests() -> None:
+    """In-process guards that catch silent LTP substitution.
+
+    1. If `kite_session.get_ltp` returns ``{}``, `place_paper_buy_at_ltp`
+       must raise `KiteSessionExpired` and `record_paper_fill` must never
+       be called. This is the regression guard for the 2026-08-12 INFY
+       fill being recorded at ₹1,500.25 when the live LTP path failed.
+    """
+    import kite_session as _ks
+
+    global record_paper_fill  # noqa: PLW0603 - intentional rebinding for the duration of the test
+
+    original_get_ltp = _ks.get_ltp
+    original_record = record_paper_fill
+    record_calls: list[dict[str, Any]] = []
+
+    def _stub_record(*args, **kwargs):
+        record_calls.append({"args": args, "kwargs": kwargs})
+        return original_record(*args, **kwargs)
+
+    _ks.get_ltp = lambda symbols: {}  # simulate MCP failure / empty LTP
+    record_paper_fill = _stub_record  # type: ignore[assignment]
+    try:
+        try:
+            place_paper_buy_at_ltp("INFY", 5)
+        except _ks.KiteSessionExpired:
+            assert not record_calls, (
+                f"record_paper_fill was called even though get_ltp returned {{}}: {record_calls!r}"
+            )
+            print("self-test ok: get_ltp={} -> KiteSessionExpired, record_paper_fill not called")
+            return
+        raise AssertionError(
+            "place_paper_buy_at_ltp did NOT raise KiteSessionExpired when get_ltp returned {}; "
+            "the silent-substitution guard has regressed."
+        )
+    finally:
+        _ks.get_ltp = original_get_ltp
+        record_paper_fill = original_record  # type: ignore[assignment]
 
 
 if __name__ == "__main__":
